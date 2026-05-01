@@ -1,0 +1,14 @@
+{
+  "name": "browser-mcp",
+  "version": "1.0.0",
+  "description": "MCP server exposing Chrome DevTools Protocol to Claude Code",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "chrome-remote-interface": "0.34.0",
+    "zod": "^3.25.0"
+  }
+}
