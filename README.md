@@ -6,7 +6,8 @@ An MCP server that connects Claude Code directly to a running Chrome instance vi
 
 | Tool | What it does |
 |------|-------------|
-| `browser_connect` | Attach to Chrome; lists open tabs and connects to the most recent page tab |
+| `browser_launch` | Launch Chrome with remote debugging, clear buffers, and attach CDP — all in one step. Primary entry point for any debugging session. |
+| `browser_connect` | Attach to an already-running Chrome instance (fallback if Chrome is already open) |
 | `browser_clear` | Wipe all buffered network and console data for a fresh capture |
 | `browser_get_page_info` | Show current URL, title, readyState, and buffer fill counts |
 | `browser_get_network_requests` | Return captured requests with status, headers, MIME type, and size |
@@ -23,7 +24,7 @@ npm install
 
 ### 2. Register with Claude Code
 
-Add this to your Claude Code MCP config (`.claude/settings.json` or `~/.claude/settings.json`):
+Add this to your project's `.mcp.json` or `~/.claude/settings.json`:
 
 ```json
 {
@@ -36,42 +37,29 @@ Add this to your Claude Code MCP config (`.claude/settings.json` or `~/.claude/s
 }
 ```
 
-### 3. Launch Chrome with remote debugging
-
-On **macOS**, use `open -a` with `--user-data-dir` pointing to a temp directory. This is required — launching the Chrome binary directly from terminal often fails to bind the debug port on macOS Sequoia (15+):
-
-```bash
-pkill -x "Google Chrome"; sleep 1
-open -a "Google Chrome" --args \
-  --remote-debugging-port=9222 \
-  --user-data-dir=/tmp/chrome-debug \
-  --no-first-run \
-  --no-default-browser-check
-```
-
-> **Why `--user-data-dir`?** Without it, Chrome may reuse an existing profile session and silently skip binding the debug port. A temp directory forces a clean startup that always binds port 9222.
-
-On **Linux**:
-
-```bash
-google-chrome --remote-debugging-port=9222 --no-first-run &
-```
-
-Verify Chrome is listening:
-
-```bash
-curl http://localhost:9222/json/version
-```
-
 ## Usage
+
+### Single-prompt workflow
+
+Tell Claude: _"launch Chrome and investigate the network requests on [URL]"_
+
+Claude calls `browser_launch` → Chrome opens automatically → you trigger the behavior → Claude queries network and console. No manual Chrome setup needed.
 
 ### Typical debugging flow
 
-1. Deploy your change, open the page in Chrome
-2. Tell Claude: _"connect to Chrome and investigate"_
-3. Claude calls `browser_connect` → `browser_clear`
-4. You trigger the behavior (click, scroll, submit a form, etc.)
+1. Deploy your change
+2. Tell Claude: _"launch Chrome and check [URL]"_
+3. Claude calls `browser_launch` (Chrome opens, buffers cleared, CDP attached)
+4. You trigger the behavior (scroll, click, submit a form, etc.)
 5. Claude queries `browser_get_network_requests` and `browser_get_console_logs`
+
+### If Chrome fails to bind port 9222
+
+```bash
+pkill -x "Google Chrome" && rm -rf /tmp/chrome-debug
+```
+
+Then tell Claude to call `browser_launch` again.
 
 ### Filtering network requests
 
@@ -80,7 +68,7 @@ curl http://localhost:9222/json/version
 filter_status_min: 400
 
 # Only show requests to a specific path
-filter_url: "/api/view-batch"
+filter_url: "/api/vast"
 
 # Only POST requests
 filter_method: POST
@@ -102,27 +90,29 @@ level: all
 ## Example session
 
 ```
-You:    Connect to Chrome and check what's happening on https://example.com
-Claude: [calls browser_connect] → Connected, attached to "Example Domain"
-        [calls browser_clear]   → Buffers cleared
-        <you interact with the page>
+You:    Launch Chrome and investigate the ad tracking on https://scrollforme.com
+Claude: [calls browser_launch url="https://scrollforme.com"] → Chrome launched, attached, buffers cleared
+        <you scroll through the page, let ads play>
 You:    Check now
-Claude: [calls browser_get_network_requests filter_status_min=400]
-        → POST 404 /api/view-batch — endpoint missing on this environment
+Claude: [calls browser_get_network_requests filter_url="ping"]
+        → GET 204 /api/ping?u=https%3A%2F%2Flive.applzr.com%2F... ✓
         [calls browser_get_console_logs level=error]
-        → Failed to load resource: /media/missing-file.mp4 (404)
+        → No errors
 ```
 
 ## Troubleshooting
 
 **`ECONNREFUSED` on port 9222**
-Chrome is running but hasn't bound the port. This almost always means it was launched without `--user-data-dir` on macOS. Kill Chrome and use the `open -a` command above.
+Chrome is running but hasn't bound the debug port. Run the reset command above and call `browser_launch` again.
 
 **`Chrome is running but has no page tabs open`**
-The debug port is up but no tab is attached. Open a tab in Chrome and call `browser_connect` again.
+The debug port is up but no tab is attached. Open a tab in Chrome and call `browser_connect`.
 
-**Port 9222 not showing in `lsof -i :9222`**
-Check `~/Library/Application Support/Google/Chrome/DevToolsActivePort` — if the file doesn't exist, Chrome never started a DevTools server. Relaunch using the command above.
+**`No page tabs found`**
+Chrome process exists but CDP returned no tabs. Run the reset command and call `browser_launch` again.
 
 **macOS Local Network permission**
 On macOS 14+, Chrome may need explicit Local Network permission. Check **System Settings → Privacy & Security → Local Network** and make sure Google Chrome is enabled.
+
+**Port 9222 not showing in `lsof -i :9222`**
+Chrome never started a DevTools server. Check `~/Library/Application Support/Google/Chrome/DevToolsActivePort`. If the file doesn't exist, relaunch via `browser_launch`.

@@ -4,6 +4,8 @@ const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
 const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
 const CDP = require('chrome-remote-interface');
 const { z } = require('zod');
+const http = require('http');
+const { spawn } = require('child_process');
 
 // ---------------------------------------------------------------------------
 // Ring buffers
@@ -194,8 +196,9 @@ const server = new McpServer({
 });
 
 const CHROME_LAUNCH_CMD =
-  '/Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome ' +
-  '--remote-debugging-port=9222 --no-first-run --no-default-browser-check 2>/dev/null &';
+  'open -a "Google Chrome" --args ' +
+  '--remote-debugging-port=9222 --user-data-dir=/tmp/chrome-debug --incognito ' +
+  '--no-first-run --no-default-browser-check';
 
 function notConnected() {
   return { content: [{ type: 'text', text: 'Not connected. Call browser_connect first.' }] };
@@ -231,7 +234,8 @@ server.tool(
       return { content: [{ type: 'text', text: 'ERROR: Chrome is running but has no page tabs open. Open a tab first.' }] };
     }
 
-    const target = pageTabs[0];
+    // Prefer http/https tabs over chrome:// internal pages
+    const target = pageTabs.find(t => /^https?:/.test(t.url)) ?? pageTabs[0];
     try {
       await attachToTarget(target);
     } catch (err) {
@@ -253,6 +257,89 @@ server.tool(
         text: `Connected to Chrome on port ${port}.\nAttached to: ${target.title}\nURL: ${target.url}\n\nAll open page tabs:\n${tabList}`,
       }],
     };
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Tool: browser_launch
+// ---------------------------------------------------------------------------
+
+function waitForChrome(port, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const deadline = Date.now() + timeoutMs;
+    function attempt() {
+      const req = http.get(`http://localhost:${port}/json/version`, () => resolve());
+      req.on('error', () => {
+        if (Date.now() >= deadline) reject(new Error(`Chrome did not bind port ${port} within ${timeoutMs}ms`));
+        else setTimeout(attempt, 200);
+      });
+      req.setTimeout(500, () => {
+        req.destroy();
+        if (Date.now() >= deadline) reject(new Error(`Chrome did not bind port ${port} within ${timeoutMs}ms`));
+        else setTimeout(attempt, 200);
+      });
+    }
+    attempt();
+  });
+}
+
+server.tool(
+  'browser_launch',
+  'Launch a fresh Chrome instance with remote debugging enabled, clear all buffers, and attach CDP — all in one step. Use this instead of browser_connect when starting a new debugging session from scratch. On macOS, uses /tmp/chrome-debug profile so it never conflicts with your regular Chrome. Returns the attached tab URL and buffer status.',
+  {
+    port: z.number().int().min(1024).max(65535).default(9222)
+      .describe('CDP port to bind. Defaults to 9222.'),
+    url: z.string().optional()
+      .describe('Optional URL to open immediately after launch.'),
+  },
+  async ({ port, url }) => {
+    state.port = port;
+
+    let alreadyRunning = false;
+    try { await waitForChrome(port, 500); alreadyRunning = true; } catch (_) {}
+
+    if (!alreadyRunning) {
+      const args = ['-a', 'Google Chrome', '--args',
+        `--remote-debugging-port=${port}`,
+        '--user-data-dir=/tmp/chrome-debug',
+        '--no-first-run',
+        '--no-default-browser-check',
+      ];
+      if (url) args.push(url);
+      const child = spawn('open', args, { detached: true, stdio: 'ignore' });
+      child.unref();
+
+      try {
+        await waitForChrome(port, 10000);
+      } catch (err) {
+        return { content: [{ type: 'text', text:
+          `ERROR: Chrome did not bind port ${port} within 10s.\n` +
+          `Fix: pkill -x "Google Chrome" && rm -rf /tmp/chrome-debug\nThen call browser_launch again.\n\n${err.message}`,
+        }]};
+      }
+    }
+
+    let tabs;
+    try { tabs = await CDP.List({ port }); }
+    catch (err) { return { content: [{ type: 'text', text: `ERROR: CDP list failed: ${err.message}` }]}; }
+
+    const pageTabs = tabs.filter(t => t.type === 'page');
+    if (!pageTabs.length) return { content: [{ type: 'text', text: 'ERROR: No page tabs found. Call browser_launch again.' }]};
+
+    const target = pageTabs.find(t => /^https?:/.test(t.url)) ?? pageTabs[0];
+    try { await attachToTarget(target); }
+    catch (err) { return { content: [{ type: 'text', text: `ERROR: CDP attach failed: ${err.message}` }]}; }
+
+    networkBuffer.clear();
+    consoleBuffer.clear();
+    state.pendingRequests.clear();
+
+    return { content: [{ type: 'text', text: [
+      alreadyRunning ? 'Chrome was already running — reused.' : 'Chrome launched.',
+      `Attached to: ${state.targetTitle}`,
+      `URL: ${state.targetUrl}`,
+      'Buffers cleared. Ready to capture.',
+    ].join('\n') }]};
   }
 );
 
